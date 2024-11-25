@@ -24,7 +24,7 @@ SyncedCron = {
   }
 }
 
-Later = Npm.require('later');
+Later = Npm.require('@breejs/later');
 
 /*
   Logger factory function. Takes a prefix string and options object
@@ -87,11 +87,11 @@ Meteor.startup(function() {
 
   // collection holding the job history records
   SyncedCron._collection = new Mongo.Collection(options.collectionName);
-  SyncedCron._collection._ensureIndex({intendedAt: 1, name: 1}, {unique: true});
+  SyncedCron._collection.createIndex({intendedAt: 1, name: 1}, {unique: true});
 
   if (options.collectionTTL) {
     if (options.collectionTTL > minTTL)
-      SyncedCron._collection._ensureIndex({startedAt: 1 },
+      SyncedCron._collection.createIndex({startedAt: 1 },
         { expireAfterSeconds: options.collectionTTL } );
     else
       log.warn('Not going to use a TTL that is shorter than:' + minTTL);
@@ -193,59 +193,62 @@ SyncedCron._entryWrapper = function(entry) {
   var self = this;
 
   return function(intendedAt) {
-    intendedAt = new Date(intendedAt.getTime());
-    intendedAt.setMilliseconds(0);
+    const syncFunction = Meteor.wrapAsync(async () => {
+      intendedAt = new Date(intendedAt.getTime());
+      intendedAt.setMilliseconds(0);
 
-    var jobHistory;
+      var jobHistory;
 
-    if (entry.persist) {
-      jobHistory = {
-        intendedAt: intendedAt,
-        name: entry.name,
-        startedAt: new Date()
-      };
+      if (entry.persist) {
+        jobHistory = {
+          intendedAt: intendedAt,
+          name: entry.name,
+          startedAt: new Date()
+        };
 
-      // If we have a dup key error, another instance has already tried to run
-      // this job.
+        // If we have a dup key error, another instance has already tried to run
+        // this job.
+        try {
+          jobHistory._id = await self._collection.insertAsync(jobHistory);
+        } catch(e) {
+          // http://www.mongodb.org/about/contributors/error-codes/
+          // 11000 == duplicate key error
+          if (e.code === 11000) {
+            log.info('Not running "' + entry.name + '" again.');
+            return;
+          }
+
+          throw e;
+        };
+      }
+
+      // run and record the job
       try {
-        jobHistory._id = self._collection.insert(jobHistory);
-      } catch(e) {
-        // http://www.mongodb.org/about/contributors/error-codes/
-        // 11000 == duplicate key error
-        if (e.code === 11000) {
-          log.info('Not running "' + entry.name + '" again.');
-          return;
+        log.info('Starting "' + entry.name + '".');
+        var output = entry.job(intendedAt,entry.name); // <- Run the actual job
+
+        log.info('Finished "' + entry.name + '".');
+        if(entry.persist) {
+          await self._collection.updateAsync({_id: jobHistory._id}, {
+            $set: {
+              finishedAt: new Date(),
+              result: output
+            }
+          });
         }
-
-        throw e;
-      };
-    }
-
-    // run and record the job
-    try {
-      log.info('Starting "' + entry.name + '".');
-      var output = entry.job(intendedAt,entry.name); // <- Run the actual job
-
-      log.info('Finished "' + entry.name + '".');
-      if(entry.persist) {
-        self._collection.update({_id: jobHistory._id}, {
-          $set: {
-            finishedAt: new Date(),
-            result: output
-          }
-        });
+      } catch(e) {
+        log.info('Exception "' + entry.name +'" ' + ((e && e.stack) ? e.stack : e));
+        if(entry.persist) {
+          await self._collection.updateAsync({_id: jobHistory._id}, {
+            $set: {
+              finishedAt: new Date(),
+              error: (e && e.stack) ? e.stack : e
+            }
+          });
+        }
       }
-    } catch(e) {
-      log.info('Exception "' + entry.name +'" ' + ((e && e.stack) ? e.stack : e));
-      if(entry.persist) {
-        self._collection.update({_id: jobHistory._id}, {
-          $set: {
-            finishedAt: new Date(),
-            error: (e && e.stack) ? e.stack : e
-          }
-        });
-      }
-    }
+    });
+    syncFunction();
   };
 }
 
